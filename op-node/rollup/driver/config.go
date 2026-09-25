@@ -43,7 +43,6 @@ type Config struct {
 	// must not be set on a real (non-replay) node.
 	ReplayPacing bool `json:"replay_pacing"`
 
-
 	// Finalizer contains runtime configuration for finality behavior.
 	Finalizer *finality.Config `json:"finalizer,omitempty"`
 }

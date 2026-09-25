@@ -47,7 +47,7 @@ type DataSourceFactory struct {
 	altDAFetcher      AltDAInputFetcher
 	altDAMaxInputSize uint64
 	ecotoneTime       *uint64
-	replayMode   bool
+	replayMode        bool
 }
 
 func NewDataSourceFactory(log log.Logger, cfg *rollup.Config, fetcher L1Fetcher, blobsFetcher L1BlobsFetcher, altDAFetcher AltDAInputFetcher, replayMode bool) *DataSourceFactory {

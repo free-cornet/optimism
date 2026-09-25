@@ -126,16 +126,16 @@ func NewDerivationPipeline(log log.Logger, rollupCfg *rollup.Config, depSet Depe
 	stages := []ResettableStage{l1Traversal, l1Src, altDA, frameQueue, channelMux, chInReader, batchMux, attributesQueue}
 
 	return &DerivationPipeline{
-		log:       	log,
-		rollupCfg: 	rollupCfg,
-		l1Fetcher: 	l1Fetcher,
-		altDA:     	altDA,
-		resetting: 	0,
-		stages:    	stages,
-		metrics:   	metrics,
-		traversal: 	l1Traversal,
-		attrib:    	attributesQueue,
-		l2:        	l2Source,
+		log:        log,
+		rollupCfg:  rollupCfg,
+		l1Fetcher:  l1Fetcher,
+		altDA:      altDA,
+		resetting:  0,
+		stages:     stages,
+		metrics:    metrics,
+		traversal:  l1Traversal,
+		attrib:     attributesQueue,
+		l2:         l2Source,
 		replayMode: replayMode,
 	}
 }

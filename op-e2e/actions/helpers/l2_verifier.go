@@ -180,7 +180,7 @@ func NewL2Verifier(t Testing, log log.Logger, l1 derive.L1Fetcher,
 		finalizer:         finalizer,
 		safeHeadListener:  safeHeadListener,
 		syncCfg:           syncCfg,
-		drainer:           executor,in
+		drainer:           executor,
 		l1:                l1,
 		syncStatus:        syncStatusTracker,
 		L2PipelineIdle:    true,
