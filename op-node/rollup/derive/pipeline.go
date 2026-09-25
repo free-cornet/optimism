@@ -93,18 +93,25 @@ type DerivationPipeline struct {
 	resetSysConfig eth.SystemConfig
 	engineIsReset  bool
 
+	// replayMode skips the channel-timeout walk-back during pipeline reset. In the
+	// replay testbed L1 is frozen and the safe head is treated as final, so there is
+	// no pre-safe-head channel data to buffer; skipping the walk-back avoids fetching
+	// (unavailable) blobs for L1 blocks below the fork origin, which would otherwise
+	// trigger an endless reset loop. Driven by the replay flag.
+	replayMode bool
+
 	metrics Metrics
 }
 
 // NewDerivationPipeline creates a DerivationPipeline, to turn L1 data into L2 block-inputs.
 func NewDerivationPipeline(log log.Logger, rollupCfg *rollup.Config, depSet DependencySet, l1Fetcher L1Fetcher, l1Blobs L1BlobsFetcher,
-	altDA AltDAInputFetcher, l2Source L2Source, metrics Metrics, l1ChainConfig *params.ChainConfig,
+	altDA AltDAInputFetcher, l2Source L2Source, metrics Metrics, l1ChainConfig *params.ChainConfig, replayMode bool,
 ) *DerivationPipeline {
 	spec := rollup.NewChainSpec(rollupCfg)
 	// Stages are strung together into a pipeline,
 	// results are pulled from the stage closed to the L2 engine, which pulls from the previous stage, and so on.
 	l1Traversal := NewL1Traversal(log, rollupCfg, l1Fetcher)
-	dataSrc := NewDataSourceFactory(log, rollupCfg, l1Fetcher, l1Blobs, altDA) // auxiliary stage for L1Retrieval
+	dataSrc := NewDataSourceFactory(log, rollupCfg, l1Fetcher, l1Blobs, altDA, replayMode) // auxiliary stage for L1Retrieval
 	l1Src := NewL1Retrieval(log, dataSrc, l1Traversal)
 	frameQueue := NewFrameQueue(log, rollupCfg, l1Src)
 	channelMux := NewChannelMux(log, spec, frameQueue, metrics)
@@ -119,16 +126,17 @@ func NewDerivationPipeline(log log.Logger, rollupCfg *rollup.Config, depSet Depe
 	stages := []ResettableStage{l1Traversal, l1Src, altDA, frameQueue, channelMux, chInReader, batchMux, attributesQueue}
 
 	return &DerivationPipeline{
-		log:       log,
-		rollupCfg: rollupCfg,
-		l1Fetcher: l1Fetcher,
-		altDA:     altDA,
-		resetting: 0,
-		stages:    stages,
-		metrics:   metrics,
-		traversal: l1Traversal,
-		attrib:    attributesQueue,
-		l2:        l2Source,
+		log:       	log,
+		rollupCfg: 	rollupCfg,
+		l1Fetcher: 	l1Fetcher,
+		altDA:     	altDA,
+		resetting: 	0,
+		stages:    	stages,
+		metrics:   	metrics,
+		traversal: 	l1Traversal,
+		attrib:    	attributesQueue,
+		l2:        	l2Source,
+		replayMode: replayMode,
 	}
 }
 
@@ -237,7 +245,12 @@ func (dp *DerivationPipeline) initialReset(ctx context.Context, resetL2Safe eth.
 		return NewTemporaryError(fmt.Errorf("failed to fetch the new L1 progress: origin: %s; err: %w", pipelineL2.L1Origin, err))
 	}
 
-	for {
+	// In replay mode L1 is frozen and the safe head is treated as final, so there is
+	// no pre-safe-head channel data to buffer. Skip the channel-timeout walk-back that
+	// would otherwise rewind the L1 traversal below the fork origin and try to fetch
+	// blobs the frozen beacon node does not have (an endless reset loop). The pipeline
+	// then starts exactly at the safe head's L1 origin.
+	for !dp.replayMode {
 		afterL2Genesis := pipelineL2.Number > dp.rollupCfg.Genesis.L2.Number
 		afterL1Genesis := pipelineL2.L1Origin.Number > dp.rollupCfg.Genesis.L1.Number
 		afterChannelTimeout := pipelineL2.L1Origin.Number+spec.ChannelTimeout(pipelineOrigin.Time) > l1Origin.Number

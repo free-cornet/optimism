@@ -30,10 +30,13 @@ type BlobDataSource struct {
 	fetcher      L1TransactionFetcher
 	blobsFetcher L1BlobsFetcher
 	log          log.Logger
+	// replayMode makes an unavailable blob (404) skip the block's batch data instead
+	// of triggering a fatal pipeline reset.
+	replayMode bool
 }
 
 // NewBlobDataSource creates a new blob data source.
-func NewBlobDataSource(ctx context.Context, log log.Logger, dsCfg DataSourceConfig, fetcher L1TransactionFetcher, blobsFetcher L1BlobsFetcher, ref eth.L1BlockRef, batcherAddr common.Address) DataIter {
+func NewBlobDataSource(ctx context.Context, log log.Logger, dsCfg DataSourceConfig, fetcher L1TransactionFetcher, blobsFetcher L1BlobsFetcher, ref eth.L1BlockRef, batcherAddr common.Address, replayMode bool) DataIter {
 	return &BlobDataSource{
 		ref:          ref,
 		dsCfg:        dsCfg,
@@ -41,6 +44,7 @@ func NewBlobDataSource(ctx context.Context, log log.Logger, dsCfg DataSourceConf
 		log:          log.New("origin", ref),
 		batcherAddr:  batcherAddr,
 		blobsFetcher: blobsFetcher,
+		replayMode:   replayMode,
 	}
 }
 
@@ -96,6 +100,13 @@ func (ds *BlobDataSource) open(ctx context.Context) ([]blobOrCalldata, error) {
 	// download the actual blob bodies corresponding to the versioned hashes
 	blobs, err := ds.blobsFetcher.GetBlobsByHash(ctx, ds.ref.Time, hashes)
 	if errors.Is(err, ethereum.NotFound) {
+		if ds.replayMode {
+			// Replay testbed: the frozen beacon node has no sidecars for this slot, and we
+			// never need to derive these (past) batches. Skip this block's batch data instead
+			// of triggering a fatal pipeline reset loop.
+			ds.log.Warn("replay mode: skipping block with unavailable blobs", "num_hashes", len(hashes))
+			return []blobOrCalldata{}, nil
+		}
 		// If the L1 block was available, then the blobs should be available too. The only
 		// exception is if the blob retention window has expired, which we will ultimately handle
 		// by failing over to a blob archival service.

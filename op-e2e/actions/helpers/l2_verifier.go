@@ -136,7 +136,7 @@ func NewL2Verifier(t Testing, log log.Logger, l1 derive.L1Fetcher,
 	sys.Register("attributes-handler", attrHandler, opts)
 	ec.SetAttributesResetter(attrHandler)
 
-	pipeline := derive.NewDerivationPipeline(log, cfg, depSet, l1, blobsSrc, altDASrc, eng, metrics, l1ChainConfig)
+	pipeline := derive.NewDerivationPipeline(log, cfg, depSet, l1, blobsSrc, altDASrc, eng, metrics, l1ChainConfig, false)
 	pipelineDeriver := derive.NewPipelineDeriver(ctx, pipeline)
 	sys.Register("pipeline", pipelineDeriver, opts)
 	ec.SetPipelineResetter(pipelineDeriver)
@@ -180,7 +180,7 @@ func NewL2Verifier(t Testing, log log.Logger, l1 derive.L1Fetcher,
 		finalizer:         finalizer,
 		safeHeadListener:  safeHeadListener,
 		syncCfg:           syncCfg,
-		drainer:           executor,
+		drainer:           executor,in
 		l1:                l1,
 		syncStatus:        syncStatusTracker,
 		L2PipelineIdle:    true,
