@@ -1276,7 +1276,7 @@ func createSequencer(log log.Logger) (*Sequencer, *sequencerTestDeps) {
 		asyncGossip: &FakeAsyncGossip{},
 		eng:         eng,
 	}
-	seq := NewSequencer(context.Background(), log, cfg, defaultSealingDuration, deps.attribBuilder,
+	seq := NewSequencer(context.Background(), log, cfg, defaultSealingDuration, false, deps.attribBuilder,
 		deps.l1OriginSelector, deps.seqState, deps.conductor,
 		deps.asyncGossip, metrics.NoopMetrics, eng)
 	// We create mock payloads, with the epoch-id as tx[0], rather than proper L1Block-info deposit tx.
