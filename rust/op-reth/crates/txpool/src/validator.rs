@@ -31,6 +31,8 @@ pub(crate) const CHECK_ACCESS_LIST_TIMEOUT_SECS: u64 = 7200;
 /// Mirrors op-geth's `l1InfoGasOverhead` (`core/txpool/validation.go`) so the tx-pool does not
 /// admit transactions that could never be included.
 pub(crate) const L1_INFO_GAS_OVERHEAD: u64 = 70_000;
+/// !ACTOR! Gas reserved on every L2 block for the accountability transaction.
+pub(crate) const ACCOUNTABILITY_GAS_OVERHEAD: u64 = 70_000;
 
 /// Tracks additional infos for the current block.
 #[derive(Debug, Default)]
@@ -217,7 +219,8 @@ where
         // network-bound (access-list filtering, up to `CHECK_ACCESS_LIST_TIMEOUT_SECS`). Rejecting
         // an over-gas-limit transaction here avoids that work and is better admission-DoS hygiene.
         let gas_limit = transaction.gas_limit();
-        let effective_gas_limit = self.inner.block_gas_limit().saturating_sub(L1_INFO_GAS_OVERHEAD);
+        // !ACTOR! Substract the accountability gas overhead on top of the L1-info gas overhead from the effective gas limit.
+        let effective_gas_limit = self.inner.block_gas_limit().saturating_sub(L1_INFO_GAS_OVERHEAD).saturating_sub(ACCOUNTABILITY_GAS_OVERHEAD);
         if gas_limit > effective_gas_limit {
             return TransactionValidationOutcome::Invalid(
                 transaction,

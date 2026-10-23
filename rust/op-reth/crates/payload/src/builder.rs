@@ -3,10 +3,13 @@ use crate::{
     OpAttributes, OpPayloadBuilderAttributes, OpPayloadPrimitives, config::OpBuilderConfig,
     error::OpPayloadBuilderError, payload::OpBuiltPayload,
 };
+
+use crate::actor::ActorClient;
+
 use alloy_consensus::{BlockHeader, Sealable, Transaction, Typed2718, transaction::Recovered};
-use alloy_eips::eip2718::Encodable2718;
+use alloy_eips::eip2718::{Decodable2718, Encodable2718};
 use alloy_evm::Evm as AlloyEvm;
-use alloy_primitives::{Address, B256, Sealed, U256};
+use alloy_primitives::{Address, B256, Bytes, Sealed, U256};
 use alloy_rpc_types_debug::ExecutionWitness;
 use alloy_rpc_types_engine::PayloadId;
 use op_alloy_consensus::{
@@ -33,7 +36,7 @@ use reth_optimism_evm::{
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_primitives::{L2_TO_L1_MESSAGE_PASSER_ADDRESS, OpTransaction};
 use reth_optimism_txpool::{
-    OpPooledTx,
+    OpPooledTransaction, OpPooledTx,
     estimated_da_size::DataAvailabilitySized,
     interop::{MaybeInteropTransaction, is_interop_tx, is_valid_interop},
 };
@@ -138,6 +141,9 @@ pub struct OpPayloadBuilder<
     /// The type responsible for yielding the best transactions for the payload if mempool
     /// transactions are allowed.
     pub best_transactions: Txs,
+
+    /// The client for interacting with the ACTOR mempool.
+    pub actor_client: Option<Arc<ActorClient>>,
     /// Marker for the payload attributes type.
     _pd: PhantomData<Attrs>,
 }
@@ -157,6 +163,7 @@ where
             config: self.config.clone(),
             best_transactions: self.best_transactions.clone(),
             compute_pending_block: self.compute_pending_block,
+            actor_client: self.actor_client.clone(),
             _pd: PhantomData,
         }
     }
@@ -184,12 +191,19 @@ impl<Pool, Client, Evm, Attrs> OpPayloadBuilder<Pool, Client, Evm, (), Attrs> {
             evm_config,
             config,
             best_transactions: (),
+            actor_client: None,
             _pd: PhantomData,
         }
     }
 }
 
 impl<Pool, Client, Evm, Txs, Attrs> OpPayloadBuilder<Pool, Client, Evm, Txs, Attrs> {
+    /// Configures the actor client used to fetch transactions.
+    pub fn with_actor_client(mut self, actor_client: Arc<ActorClient>) -> Self {
+        self.actor_client = Some(actor_client);
+        self
+    }
+
     /// Sets the rollup's compute pending block configuration option.
     pub const fn set_compute_pending_block(mut self, compute_pending_block: bool) -> Self {
         self.compute_pending_block = compute_pending_block;
@@ -202,7 +216,7 @@ impl<Pool, Client, Evm, Txs, Attrs> OpPayloadBuilder<Pool, Client, Evm, Txs, Att
         self,
         best_transactions: T,
     ) -> OpPayloadBuilder<Pool, Client, Evm, T, Attrs> {
-        let Self { pool, client, compute_pending_block, evm_config, config, .. } = self;
+        let Self { pool, client, compute_pending_block, evm_config, config, actor_client, .. } = self;
         OpPayloadBuilder {
             pool,
             client,
@@ -210,6 +224,7 @@ impl<Pool, Client, Evm, Txs, Attrs> OpPayloadBuilder<Pool, Client, Evm, Txs, Att
             evm_config,
             best_transactions,
             config,
+            actor_client,
             _pd: PhantomData,
         }
     }
@@ -265,7 +280,7 @@ where
             best_payload,
         };
 
-        let builder = OpBuilder::new(best);
+        let builder = OpBuilder::new(best).with_actor_client(self.actor_client.clone());
 
         let state_provider = self.client.state_by_block_hash(ctx.parent().hash())?;
         let state = StateProviderDatabase::new(&state_provider);
@@ -433,12 +448,19 @@ pub struct OpBuilder<'a, Txs> {
     /// Yields the best transaction to include if transactions from the mempool are allowed.
     #[debug(skip)]
     best: Box<dyn FnOnce(BestTransactionsAttributes) -> Txs + 'a>,
+    actor_client: Option<Arc<ActorClient>>,
 }
 
 impl<'a, Txs> OpBuilder<'a, Txs> {
     /// Creates a new [`OpBuilder`].
     pub fn new(best: impl FnOnce(BestTransactionsAttributes) -> Txs + Send + Sync + 'a) -> Self {
-        Self { best: Box::new(best) }
+        Self { best: Box::new(best), actor_client: None }
+    }
+
+    /// Configures the client used to fetch transactions from the ACTOR mempool.
+    pub fn with_actor_client(mut self, actor_client: Option<Arc<ActorClient>>) -> Self {
+        self.actor_client = actor_client;
+        self
     }
 }
 
@@ -462,7 +484,7 @@ impl<Txs> OpBuilder<'_, Txs> {
             PayloadTransactions<Transaction: PoolTransaction<Consensus = N::SignedTx> + OpPooledTx>,
         Attrs: OpAttributes<Transaction = N::SignedTx>,
     {
-        let Self { best } = self;
+        let Self { best, actor_client } = self;
         debug!(target: "payload_builder", id=%ctx.payload_id(), parent_header = ?ctx.parent().hash(), parent_number = ctx.parent().number(), "building new payload");
 
         let mut db = State::builder().with_database(db).with_bundle_update().build();
@@ -493,23 +515,30 @@ impl<Txs> OpBuilder<'_, Txs> {
 
         // 3. if mem pool transactions are requested we execute them
         if !ctx.attributes().no_tx_pool() {
-            let best_txs = best(ctx.best_transaction_attributes(builder.evm_mut().block()));
-            if ctx
-                .execute_best_transactions(
+            if let Some(actor_client) = actor_client.as_ref() {
+                if ctx.execute_encrypted_transactions(
+                    &mut info,
+                    &mut builder,
+                    actor_client,
+                )? {
+                    return Ok(BuildOutcomeKind::Cancelled);
+                }
+            } else {
+                let best_txs =
+                    best(ctx.best_transaction_attributes(builder.evm_mut().block()));
+
+                if ctx.execute_best_transactions(
                     &mut info,
                     &mut builder,
                     RethPayloadTransactions(best_txs),
                     None,
                     None,
-                )?
-                .is_some()
-            {
-                return Ok(BuildOutcomeKind::Cancelled);
+                )?.is_some() {
+                    return Ok(BuildOutcomeKind::Cancelled);
+                }
             }
 
-            // check if the new payload is even more valuable
             if !ctx.is_better_payload(info.total_fees) {
-                // can skip building the block
                 return Ok(BuildOutcomeKind::Aborted { fees: info.total_fees });
             }
         }
@@ -1039,6 +1068,163 @@ where
         }
 
         Ok(info)
+    }
+
+    /// Decodes and executes an ACTOR batch in the order returned by the mempool.
+    ///
+    /// Returns `Ok(true)` if the payload build was cancelled.
+    fn execute_encrypted_batch<Builder>(
+        &self,
+        info: &mut ExecutionInfo,
+        builder: &mut Builder,
+        raw_txs: Vec<Bytes>,
+        block_gas_limit: u64,
+    ) -> Result<bool, PayloadBuilderError>
+    where
+        Builder: BlockBuilder<Primitives = Evm::Primitives>,
+        <<Builder::Executor as BlockExecutor>::Evm as AlloyEvm>::DB: Database,
+        <Builder::Executor as BlockExecutor>::Result: PreRefundGasUsed,
+    {
+        let base_fee = builder.evm_mut().block().basefee();
+        let block_da_limit = self.builder_config.da_config.max_da_block_size();
+        let tx_da_limit = self.builder_config.da_config.max_da_tx_size();
+        let max_uncompressed_block_size = self.builder_config.max_uncompressed_block_size;
+
+        for raw_tx in raw_txs {
+            if self.cancel.is_cancelled() {
+                return Ok(true);
+            }
+
+            let tx = TxTy::<Evm::Primitives>::decode_2718_exact(raw_tx.as_ref())
+                .map_err(PayloadBuilderError::other)?;
+            if tx.is_eip4844() || tx.is_deposit() {
+                continue;
+            }
+
+            let miner_fee = tx.effective_tip_per_gas(base_fee).ok_or_else(|| {
+                PayloadBuilderError::other(std::io::Error::other(
+                    "ACTOR transaction has no valid effective tip at the block base fee"
+                ))
+            })?;
+            let tx_uncompressed_size = tx.encode_2718_len() as u64;
+            let tx_gas_limit = tx.gas_limit();
+            let recovered_tx = tx.try_into_recovered().map_err(|_| {
+                PayloadBuilderError::other(std::io::Error::other(
+                    "failed to recover ACTOR transaction sender"
+                ))
+            })?;
+            let tx_da_size = OpPooledTransaction::<TxTy<Evm::Primitives>>::new(
+                recovered_tx.clone(),
+                tx_uncompressed_size as usize,
+            )
+            .estimated_da_size();
+            let da_footprint_gas_scalar = self
+                .chain_spec
+                .is_jovian_active_at_timestamp(self.attributes().timestamp())
+                .then_some(
+                    L1BlockInfo::fetch_da_footprint_gas_scalar(builder.evm_mut().db_mut())
+                        .expect("DA footprint should always be available from the database post jovian"),
+                );
+
+            if info.is_tx_over_limits(
+                tx_da_size,
+                block_gas_limit,
+                tx_da_limit,
+                block_da_limit,
+                tx_gas_limit,
+                da_footprint_gas_scalar,
+                tx_uncompressed_size,
+                max_uncompressed_block_size,
+            ) {
+                continue;
+            }
+
+            let mut evm_gas_used = 0;
+            let gas_used = match builder
+                .execute_transaction_with_result_closure(recovered_tx, |result| {
+                    evm_gas_used = result.evm_gas_used()
+                }) {
+                Ok(gas_used) => gas_used,
+                Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
+                    error,
+                    ..
+                })) => {
+                    trace!(target: "payload_builder", %error, "skipping invalid ACTOR transaction");
+                    continue;
+                }
+                Err(err) => {
+                    return Err(PayloadBuilderError::EvmExecutionError(Box::new(err)));
+                }
+            };
+
+            let tx_gas_used = gas_used.tx_gas_used();
+            info.accumulate_gas(tx_gas_used, evm_gas_used);
+            info.cumulative_da_bytes_used += tx_da_size;
+            info.cumulative_uncompressed_bytes += tx_uncompressed_size;
+            info.total_fees += U256::from(miner_fee) * U256::from(tx_gas_used);
+        }
+
+        Ok(false)
+    }
+
+    /// Fetches and executes ACTOR transaction batches until the queue is empty or the block is full.
+    ///
+    /// Returns `Ok(true)` if the payload build was cancelled.
+    pub fn execute_encrypted_transactions<Builder>(
+        &self,
+        info: &mut ExecutionInfo,
+        builder: &mut Builder,
+        actor_client: &ActorClient,
+    ) -> Result<bool, PayloadBuilderError>
+    where
+        Builder: BlockBuilder<Primitives = Evm::Primitives>,
+        <<Builder::Executor as BlockExecutor>::Evm as AlloyEvm>::DB: Database,
+        <Builder::Executor as BlockExecutor>::Result: PreRefundGasUsed,
+    {
+        let mut block_gas_limit = builder.evm_mut().block().gas_limit();
+
+        if let Some(configured_limit) =
+            self.builder_config.gas_limit_config.gas_limit()
+        {
+            block_gas_limit = block_gas_limit.min(configured_limit);
+        }
+
+        loop {
+            if self.cancel.is_cancelled() {
+                return Ok(true);
+            }
+
+            // Use pre-refund gas for admission, matching is_tx_over_limits().
+            let remaining_gas = block_gas_limit
+                .saturating_sub(info.cumulative_evm_gas_used);
+
+            if remaining_gas == 0 {
+                break;
+            }
+
+            let raw_txs = actor_client
+                .fetch_txs(remaining_gas)
+                .map_err(|err| {
+                    PayloadBuilderError::other(std::io::Error::other(err.to_string()))
+                })?;
+            println!("Fetched {} transactions from the mempool", raw_txs.len());
+            println!("Raw transactions: {:?}", raw_txs);
+            if raw_txs.is_empty() {
+                // Empty means the encrypted mempool has ended this block's queue.
+                break;
+            }
+
+            if self.execute_encrypted_batch(
+                info,
+                builder,
+                raw_txs,
+                block_gas_limit,
+            )? {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     /// Executes the given best transactions and updates the execution info.

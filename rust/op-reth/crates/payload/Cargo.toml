@@ -53,6 +53,9 @@ thiserror.workspace = true
 sha2.workspace = true
 serde.workspace = true
 
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"] }
+anyhow = "1"
+
 [dev-dependencies]
 reth-optimism-chainspec = { workspace = true, features = ["superchain-configs"] }
 reth-revm = { workspace = true, features = ["test-utils"] }

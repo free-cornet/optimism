@@ -39,7 +39,7 @@ use reth_optimism_evm::{ConfigurePostExecEvm, OpEvmConfig, OpRethReceiptBuilder}
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_payload_builder::{
     OpBuiltPayload, OpExecData, OpPayloadBuilderAttributes, OpPayloadPrimitives,
-    builder::OpPayloadTransactions,
+    actor::ActorClient, builder::OpPayloadTransactions,
     config::{OpBuilderConfig, OpDAConfig, OpGasLimitConfig, OperatorSdmOptIn},
 };
 use reth_optimism_primitives::{DepositReceipt, OpPrimitives};
@@ -1593,6 +1593,10 @@ where
             self.builder_config.clone(),
         )
         .with_transactions(self.best_transactions.clone())
+        .with_actor_client(Arc::new(
+            ActorClient::new("http://127.0.0.1:12345")
+                .map_err(|err| eyre::eyre!(err.to_string()))?,
+        ))
         .set_compute_pending_block(self.compute_pending_block);
         Ok(payload_builder)
     }
