@@ -5,7 +5,7 @@ use alloy_primitives::Bytes;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::{
-    sync::mpsc::{self, Sender},
+    sync::{Arc, Mutex, mpsc::{self, Sender}},
     thread,
     time::Duration,
 };
@@ -15,6 +15,7 @@ use std::{
 /// Client for fetching ordered transaction batches from ACTOR.
 pub struct ActorClient {
     requests: Sender<RpcCommand>,
+    completed_through_block: Arc<Mutex<Option<u64>>>,
 }
 
 enum RpcCommand {
@@ -106,7 +107,7 @@ impl ActorClient {
             .map_err(|err| anyhow::anyhow!("ACTOR HTTP client thread stopped: {err}"))?
             .map_err(anyhow::Error::msg)?;
 
-        Ok(Self { requests })
+        Ok(Self { requests, completed_through_block: Arc::new(Mutex::new(None)) })
     }
 
     /// Fetches the next ordered batch.
@@ -115,16 +116,39 @@ impl ActorClient {
     /// Do not automatically retry a request after an ambiguous
     /// transport failure unless the RPC protocol guarantees
     /// that doing so cannot skip transactions.
-    pub fn fetch_txs(&self, max_gas: u64) -> anyhow::Result<ActorTxBatch> {
-        let (response, result) = mpsc::channel();
-        println!("Sending request to fetch txs with max_gas: {}", max_gas);
-        self.requests
-            .send(RpcCommand::FetchTxs { max_gas, response })
-            .map_err(|err| anyhow::anyhow!("ACTOR HTTP client thread stopped: {err}"))?;
-        result
-            .recv()
-            .map_err(|err| anyhow::anyhow!("ACTOR HTTP response channel closed: {err}"))?
+    pub fn fetch_txs(&self, block_number: u64, max_gas: u64) -> anyhow::Result<ActorTxBatch> {
+        let mut completed_through_block = self
+            .completed_through_block
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ACTOR completion state mutex poisoned"))?;
+        fetch_txs_for_block(block_number, &mut completed_through_block, || {
+            let (response, result) = mpsc::channel();
+            self.requests
+                .send(RpcCommand::FetchTxs { max_gas, response })
+                .map_err(|err| anyhow::anyhow!("ACTOR HTTP client thread stopped: {err}"))?;
+            result
+                .recv()
+                .map_err(|err| anyhow::anyhow!("ACTOR HTTP response channel closed: {err}"))?
+        })
     }
+}
+
+fn fetch_txs_for_block(
+    block_number: u64,
+    completed_through_block: &mut Option<u64>,
+    fetch: impl FnOnce() -> anyhow::Result<ActorTxBatch>,
+) -> anyhow::Result<ActorTxBatch> {
+    if completed_through_block.is_some_and(|complete| block_number <= complete) {
+        return Ok(ActorTxBatch { txs: Vec::new(), block_complete: true });
+    }
+
+    let batch = fetch()?;
+    if batch.block_complete {
+        *completed_through_block = Some(
+            completed_through_block.map_or(block_number, |complete| complete.max(block_number)),
+        );
+    }
+    Ok(batch)
 }
 
 fn fetch_txs(http: &Client, endpoint: &str, max_gas: u64) -> anyhow::Result<ActorTxBatch> {
@@ -179,5 +203,28 @@ mod tests {
 
         assert_eq!(batch.txs, vec![Bytes::from_static(&[0x02])]);
         assert!(!batch.block_complete);
+    }
+
+    #[test]
+    fn completed_block_does_not_fetch_again() {
+        let mut completed_through_block = None;
+        let mut fetch_called = false;
+
+        let first_batch = fetch_txs_for_block(3119, &mut completed_through_block, || {
+            fetch_called = true;
+            Ok(ActorTxBatch { txs: vec![], block_complete: true })
+        })
+        .unwrap();
+
+        assert!(fetch_called);
+        assert!(first_batch.block_complete);
+
+        let later_batch = fetch_txs_for_block(3119, &mut completed_through_block, || {
+            panic!("a completed block must not trigger another fetch")
+        })
+        .unwrap();
+
+        assert!(later_batch.txs.is_empty());
+        assert!(later_batch.block_complete);
     }
 }

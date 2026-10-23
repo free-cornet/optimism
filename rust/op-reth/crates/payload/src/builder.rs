@@ -1203,7 +1203,7 @@ where
             }
 
             let batch = actor_client
-                .fetch_txs(remaining_gas)
+                .fetch_txs(self.parent().number().saturating_add(1), remaining_gas)
                 .map_err(|err| {
                     PayloadBuilderError::other(std::io::Error::other(err.to_string()))
                 })?;
