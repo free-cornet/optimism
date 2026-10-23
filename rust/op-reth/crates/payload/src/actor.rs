@@ -20,7 +20,7 @@ pub struct ActorClient {
 enum RpcCommand {
     FetchTxs {
         max_gas: u64,
-        response: Sender<anyhow::Result<Vec<Bytes>>>,
+        response: Sender<anyhow::Result<ActorTxBatch>>,
     },
 }
 
@@ -38,15 +38,32 @@ struct RpcParams {
     max_gas: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct RpcResponse {
     result: Option<RpcResult>,
     error: Option<RpcError>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct RpcResult {
     txs: Vec<Bytes>,
+    #[serde(default)]
+    actx: Option<serde::de::IgnoredAny>,
+}
+
+/// A batch of transactions returned by ACTOR and whether it completes the current block.
+#[derive(Debug)]
+pub struct ActorTxBatch {
+    /// Ordered transactions to execute.
+    pub txs: Vec<Bytes>,
+    /// Whether ACTOR has no more transactions for the current block.
+    pub block_complete: bool,
+}
+
+impl From<RpcResult> for ActorTxBatch {
+    fn from(result: RpcResult) -> Self {
+        Self { txs: result.txs, block_complete: result.actx.is_some() }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,7 +115,7 @@ impl ActorClient {
     /// Do not automatically retry a request after an ambiguous
     /// transport failure unless the RPC protocol guarantees
     /// that doing so cannot skip transactions.
-    pub fn fetch_txs(&self, max_gas: u64) -> anyhow::Result<Vec<Bytes>> {
+    pub fn fetch_txs(&self, max_gas: u64) -> anyhow::Result<ActorTxBatch> {
         let (response, result) = mpsc::channel();
         println!("Sending request to fetch txs with max_gas: {}", max_gas);
         self.requests
@@ -110,7 +127,7 @@ impl ActorClient {
     }
 }
 
-fn fetch_txs(http: &Client, endpoint: &str, max_gas: u64) -> anyhow::Result<Vec<Bytes>> {
+fn fetch_txs(http: &Client, endpoint: &str, max_gas: u64) -> anyhow::Result<ActorTxBatch> {
     let request = RpcRequest {
         jsonrpc: "2.0",
         id: 1,
@@ -129,10 +146,38 @@ fn fetch_txs(http: &Client, endpoint: &str, max_gas: u64) -> anyhow::Result<Vec<
         anyhow::bail!("fetchTxs failed ({}): {}", error.code, error.message);
     }
 
-    println!("Received response: {:?}", response);
-
-    response
+    let result = response
         .result
-        .map(|result| result.txs)
-        .ok_or_else(|| anyhow::anyhow!("fetchTxs response is missing result"))
+        .ok_or_else(|| anyhow::anyhow!("fetchTxs response is missing result"))?;
+    println!("Received {} transactions", result.txs.len());
+    Ok(result.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_with_actx_marks_batch_complete() {
+        let response: RpcResponse = serde_json::from_str(
+            r#"{"result":{"txs":["0x02"],"actx":{"blockNumber":3119,"currentPoolHash":"c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470","nextPoolHash":"fe81ecfd6080a6d3f84b8edc376e4179e08af8805b4133dbecee3592371ccb62","nextTxGas":0,"orderedTxs":[],"signature":"29753f06062cda61ba1c7379251feeb1226a4051f0ca74953877ac3a289b0a7e870aa2e37930ad38a5e89bcdac7c3c93de3590c2e63203a16d5770f60372f486"}}}"#,
+        )
+        .unwrap();
+
+        let batch: ActorTxBatch = response.result.unwrap().into();
+
+        assert_eq!(batch.txs, vec![Bytes::from_static(&[0x02])]);
+        assert!(batch.block_complete);
+    }
+
+    #[test]
+    fn response_without_actx_does_not_mark_batch_complete() {
+        let response: RpcResponse =
+            serde_json::from_str(r#"{"result":{"txs":["0x02"]}}"#).unwrap();
+
+        let batch: ActorTxBatch = response.result.unwrap().into();
+
+        assert_eq!(batch.txs, vec![Bytes::from_static(&[0x02])]);
+        assert!(!batch.block_complete);
+    }
 }

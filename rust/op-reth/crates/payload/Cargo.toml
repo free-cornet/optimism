@@ -60,3 +60,4 @@ anyhow = "1"
 reth-optimism-chainspec = { workspace = true, features = ["superchain-configs"] }
 reth-revm = { workspace = true, features = ["test-utils"] }
 alloy-rpc-types-eth.workspace = true
+serde_json.workspace = true

@@ -1202,14 +1202,14 @@ where
                 break;
             }
 
-            let raw_txs = actor_client
+            let batch = actor_client
                 .fetch_txs(remaining_gas)
                 .map_err(|err| {
                     PayloadBuilderError::other(std::io::Error::other(err.to_string()))
                 })?;
-            println!("Fetched {} transactions from the mempool", raw_txs.len());
-            println!("Raw transactions: {:?}", raw_txs);
-            if raw_txs.is_empty() {
+            println!("Fetch ACTOR batch txs: {:?}", batch.txs);
+            println!("ACTx is present: {:?}", batch.block_complete);
+            if batch.txs.is_empty() {
                 // Empty means the encrypted mempool has ended this block's queue.
                 break;
             }
@@ -1217,10 +1217,14 @@ where
             if self.execute_encrypted_batch(
                 info,
                 builder,
-                raw_txs,
+                batch.txs,
                 block_gas_limit,
             )? {
                 return Ok(true);
+            }
+
+            if batch.block_complete {
+                break;
             }
         }
 
