@@ -9,7 +9,7 @@ use crate::actor::ActorClient;
 use alloy_consensus::{BlockHeader, Sealable, Transaction, Typed2718, transaction::Recovered};
 use alloy_eips::eip2718::{Decodable2718, Encodable2718};
 use alloy_evm::Evm as AlloyEvm;
-use alloy_primitives::{Address, B256, Bytes, Sealed, U256};
+use alloy_primitives::{Address, B256, Bytes, Sealed, U256, keccak256};
 use alloy_rpc_types_debug::ExecutionWitness;
 use alloy_rpc_types_engine::PayloadId;
 use op_alloy_consensus::{
@@ -54,7 +54,7 @@ use reth_storage_api::{StateProvider, StateProviderFactory, errors::ProviderErro
 use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction, TransactionPool};
 use revm::context::{Block, BlockEnv};
 use std::{marker::PhantomData, sync::Arc};
-use tracing::{debug, trace, warn};
+use tracing::info;
 
 /// SDM/PostExec payload-builder metrics.
 #[derive(Metrics, Clone)]
@@ -112,10 +112,10 @@ where
     let post_exec_recovered = build_post_exec_recovered_tx(block_number, entries);
 
     execute(post_exec_recovered).map_err(|err| {
-        warn!(target: "payload_builder", %err, "post-exec tx execution failed, aborting payload");
+        info!(target: "payload_builder", %err, "post-exec tx execution failed, aborting payload");
         PayloadBuilderError::evm(err)
     })?;
-    debug!(target: "payload_builder", "post-exec tx included in block");
+    info!(target: "payload_builder", "post-exec tx included in block");
     Ok(true)
 }
 
@@ -485,7 +485,7 @@ impl<Txs> OpBuilder<'_, Txs> {
         Attrs: OpAttributes<Transaction = N::SignedTx>,
     {
         let Self { best, actor_client } = self;
-        debug!(target: "payload_builder", id=%ctx.payload_id(), parent_header = ?ctx.parent().hash(), parent_number = ctx.parent().number(), "building new payload");
+        info!(target: "payload_builder", id=%ctx.payload_id(), parent_header = ?ctx.parent().hash(), parent_number = ctx.parent().number(), "building new payload");
 
         let mut db = State::builder().with_database(db).with_bundle_update().build();
 
@@ -506,7 +506,7 @@ impl<Txs> OpBuilder<'_, Txs> {
 
         // 1. apply pre-execution changes
         builder.apply_pre_execution_changes().map_err(|err| {
-            warn!(target: "payload_builder", %err, "failed to apply pre-execution changes");
+            info!(target: "payload_builder", %err, "failed to apply pre-execution changes");
             PayloadBuilderError::Internal(err.into())
         })?;
 
@@ -569,7 +569,7 @@ impl<Txs> OpBuilder<'_, Txs> {
         OpPayloadBuilderMetrics::default().record_sdm_refund_gas(sdm_refund_gas);
 
         let sealed_block = Arc::new(block.sealed_block().clone());
-        debug!(target: "payload_builder", id=%ctx.attributes().payload_id(), sealed_block_header = ?sealed_block.header(), "sealed built block");
+        info!(target: "payload_builder", id=%ctx.attributes().payload_id(), sealed_block_header = ?sealed_block.header(), "sealed built block");
 
         let execution_outcome =
             BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
@@ -1042,7 +1042,7 @@ where
                     error,
                     ..
                 })) => {
-                    trace!(target: "payload_builder", %error, ?sequencer_tx, "Error in sequencer transaction, skipping.");
+                    info!(target: "payload_builder", %error, ?sequencer_tx, "Error in sequencer transaction, skipping.");
                     continue;
                 }
                 Err(err) => {
@@ -1089,30 +1089,87 @@ where
         let block_da_limit = self.builder_config.da_config.max_da_block_size();
         let tx_da_limit = self.builder_config.da_config.max_da_tx_size();
         let max_uncompressed_block_size = self.builder_config.max_uncompressed_block_size;
+        let block_number = self.parent().number().saturating_add(1);
+        let batch_tx_count = raw_txs.len();
+        let mut included_tx_count = 0;
+        let mut skipped_type_count = 0;
+        let mut skipped_limit_count = 0;
+        let mut skipped_invalid_count = 0;
+        let starting_evm_gas_used = info.cumulative_evm_gas_used;
+        let starting_total_fees = info.total_fees;
 
-        for raw_tx in raw_txs {
+        for (batch_index, raw_tx) in raw_txs.into_iter().enumerate() {
             if self.cancel.is_cancelled() {
+                info!(
+                    target: "payload_builder",
+                    block_number,
+                    batch_tx_count,
+                    batch_index,
+                    included_tx_count,
+                    "cancelled while processing ACTOR transaction batch"
+                );
                 return Ok(true);
             }
 
-            let tx = TxTy::<Evm::Primitives>::decode_2718_exact(raw_tx.as_ref())
-                .map_err(PayloadBuilderError::other)?;
+            let tx_hash = keccak256(raw_tx.as_ref());
+            let tx = TxTy::<Evm::Primitives>::decode_2718_exact(raw_tx.as_ref()).map_err(|err| {
+                info!(
+                    target: "payload_builder",
+                    block_number,
+                    batch_index,
+                    %tx_hash,
+                    %err,
+                    "failed to decode ACTOR transaction"
+                );
+                PayloadBuilderError::other(err)
+            })?;
             if tx.is_eip4844() || tx.is_deposit() {
+                skipped_type_count += 1;
+                info!(
+                    target: "payload_builder",
+                    block_number,
+                    batch_index,
+                    %tx_hash,
+                    is_blob = tx.is_eip4844(),
+                    is_deposit = tx.is_deposit(),
+                    "skipping unsupported ACTOR transaction type"
+                );
                 continue;
             }
 
-            let miner_fee = tx.effective_tip_per_gas(base_fee).ok_or_else(|| {
-                PayloadBuilderError::other(std::io::Error::other(
-                    "ACTOR transaction has no valid effective tip at the block base fee"
-                ))
-            })?;
+            let miner_fee = match tx.effective_tip_per_gas(base_fee) {
+                Some(miner_fee) => miner_fee,
+                None => {
+                    info!(
+                        target: "payload_builder",
+                        block_number,
+                        batch_index,
+                        %tx_hash,
+                        %base_fee,
+                        "ACTOR transaction has no valid effective tip at the block base fee"
+                    );
+                    return Err(PayloadBuilderError::other(std::io::Error::other(
+                        "ACTOR transaction has no valid effective tip at the block base fee",
+                    )));
+                }
+            };
             let tx_uncompressed_size = tx.encode_2718_len() as u64;
             let tx_gas_limit = tx.gas_limit();
-            let recovered_tx = tx.try_into_recovered().map_err(|_| {
-                PayloadBuilderError::other(std::io::Error::other(
+            let recovered_tx = tx.try_into_recovered().map_err(|err| {
+                info!(
+                    target: "payload_builder",
+                    block_number,
+                    batch_index,
+                    %tx_hash,
+                    ?err,
                     "failed to recover ACTOR transaction sender"
+                );
+                PayloadBuilderError::other(std::io::Error::other(
+                    "failed to recover ACTOR transaction sender",
                 ))
             })?;
+            let sender = recovered_tx.signer();
+            let nonce = recovered_tx.nonce();
             let tx_da_size = OpPooledTransaction::<TxTy<Evm::Primitives>>::new(
                 recovered_tx.clone(),
                 tx_uncompressed_size as usize,
@@ -1136,6 +1193,24 @@ where
                 tx_uncompressed_size,
                 max_uncompressed_block_size,
             ) {
+                skipped_limit_count += 1;
+                info!(
+                    target: "payload_builder",
+                    block_number,
+                    batch_index,
+                    %tx_hash,
+                    %sender,
+                    nonce,
+                    tx_gas_limit,
+                    tx_da_size,
+                    tx_uncompressed_size,
+                    cumulative_evm_gas_used = info.cumulative_evm_gas_used,
+                    block_gas_limit,
+                    tx_da_limit = ?tx_da_limit,
+                    block_da_limit = ?block_da_limit,
+                    max_uncompressed_block_size = ?max_uncompressed_block_size,
+                    "skipping ACTOR transaction because it exceeds a payload limit"
+                );
                 continue;
             }
 
@@ -1149,10 +1224,31 @@ where
                     error,
                     ..
                 })) => {
-                    trace!(target: "payload_builder", %error, "skipping invalid ACTOR transaction");
+                    skipped_invalid_count += 1;
+                    info!(
+                        target: "payload_builder",
+                        block_number,
+                        batch_index,
+                        %tx_hash,
+                        %sender,
+                        nonce,
+                        tx_gas_limit,
+                        %error,
+                        "skipping invalid ACTOR transaction"
+                    );
                     continue;
                 }
                 Err(err) => {
+                    info!(
+                        target: "payload_builder",
+                        block_number,
+                        batch_index,
+                        %tx_hash,
+                        %sender,
+                        nonce,
+                        %err,
+                        "fatal EVM error executing ACTOR transaction"
+                    );
                     return Err(PayloadBuilderError::EvmExecutionError(Box::new(err)));
                 }
             };
@@ -1162,8 +1258,34 @@ where
             info.cumulative_da_bytes_used += tx_da_size;
             info.cumulative_uncompressed_bytes += tx_uncompressed_size;
             info.total_fees += U256::from(miner_fee) * U256::from(tx_gas_used);
+            included_tx_count += 1;
+            info!(
+                target: "payload_builder",
+                block_number,
+                batch_index,
+                %tx_hash,
+                %sender,
+                nonce,
+                tx_gas_limit,
+                tx_gas_used,
+                evm_gas_used,
+                tx_da_size,
+                "included ACTOR transaction"
+            );
         }
 
+        info!(
+            target: "payload_builder",
+            block_number,
+            batch_tx_count,
+            included_tx_count,
+            skipped_type_count,
+            skipped_limit_count,
+            skipped_invalid_count,
+            evm_gas_used = info.cumulative_evm_gas_used.saturating_sub(starting_evm_gas_used),
+            fees = ?info.total_fees.saturating_sub(starting_total_fees),
+            "processed ACTOR transaction batch"
+        );
         Ok(false)
     }
 
@@ -1207,8 +1329,14 @@ where
                 .map_err(|err| {
                     PayloadBuilderError::other(std::io::Error::other(err.to_string()))
                 })?;
-            println!("Fetch ACTOR batch txs: {:?}", batch.txs);
-            println!("ACTx is present: {:?}", batch.block_complete);
+            info!(
+                target: "payload_builder",
+                block_number = self.parent().number().saturating_add(1),
+                requested_max_gas = remaining_gas,
+                returned_transactions = batch.txs.len(),
+                block_complete = batch.block_complete,
+                "received ACTOR transaction batch"
+            );
             if batch.txs.is_empty() {
                 // Empty means the encrypted mempool has ended this block's queue.
                 break;
@@ -1359,11 +1487,11 @@ where
                 })) => {
                     if error.is_nonce_too_low() {
                         // if the nonce is too low, we can skip this transaction
-                        trace!(target: "payload_builder", %error, ?tx, "skipping nonce too low transaction");
+                        info!(target: "payload_builder", %error, ?tx, "skipping nonce too low transaction");
                     } else {
                         // if the transaction is invalid, we can skip it and all of its
                         // descendants
-                        trace!(target: "payload_builder", %error, ?tx, "skipping invalid transaction and its descendants");
+                        info!(target: "payload_builder", %error, ?tx, "skipping invalid transaction and its descendants");
                         best_txs.mark_invalid(tx.signer(), tx.nonce());
                     }
                     continue;

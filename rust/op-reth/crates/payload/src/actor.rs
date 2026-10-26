@@ -9,6 +9,7 @@ use std::{
     thread,
     time::Duration,
 };
+use tracing::info;
 
 #[derive(Debug)]
 #[derive(Clone)]
@@ -173,7 +174,7 @@ fn fetch_txs(http: &Client, endpoint: &str, max_gas: u64) -> anyhow::Result<Acto
     let result = response
         .result
         .ok_or_else(|| anyhow::anyhow!("fetchTxs response is missing result"))?;
-    println!("Received {} transactions", result.txs.len());
+    info!("Received {} transactions", result.txs.len());
     Ok(result.into())
 }
 
