@@ -1,7 +1,7 @@
 
 //! HTTP JSON-RPC client for the ACTOR transaction mempool.
 
-use alloy_primitives::Bytes;
+use alloy_primitives::{Bytes, keccak256};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -57,7 +57,16 @@ struct RpcResponse {
 struct RpcResult {
     txs: Vec<Bytes>,
     #[serde(default)]
-    actx: Option<serde::de::IgnoredAny>,
+    actx: Option<RpcActx>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RpcActx {
+    #[serde(default)]
+    new_pending_txs: Vec<String>,
+    #[serde(default)]
+    ordered_txs: Vec<String>,
 }
 
 /// A batch of transactions returned by ACTOR and whether it completes the current block.
@@ -206,6 +215,18 @@ fn fetch_txs(
     let result = response
         .result
         .ok_or_else(|| anyhow::anyhow!("fetchTxs response is missing result"))?;
+    if let Some(actx) = &result.actx {
+        for hash in &actx.new_pending_txs {
+            info!("fetchTxs|NEW_PENDING_TX|{hash}");
+        }
+        for hash in &actx.ordered_txs {
+            info!("fetchTxs|ORDERED_TX|{hash}");
+        }
+    }
+    for tx in &result.txs {
+        let hash: String = keccak256(tx).iter().map(|b| format!("{b:02x}")).collect();
+        info!("fetchTxs|FETCHED_TX_HASH|{hash}");
+    }
     info!("Received {} transactions", result.txs.len());
     Ok(result.into())
 }
