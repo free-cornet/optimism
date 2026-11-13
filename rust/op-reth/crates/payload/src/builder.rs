@@ -1072,14 +1072,15 @@ where
 
     /// Decodes and executes an ACTOR batch in the order returned by the mempool.
     ///
-    /// Returns `Ok(true)` if the payload build was cancelled.
+    /// Returns `Ok(Some(count))` with the included-or-invalid transaction count when the batch
+    /// completes, or `Ok(None)` if the payload build was cancelled.
     fn execute_encrypted_batch<Builder>(
         &self,
         info: &mut ExecutionInfo,
         builder: &mut Builder,
         raw_txs: Vec<Bytes>,
         block_gas_limit: u64,
-    ) -> Result<bool, PayloadBuilderError>
+    ) -> Result<Option<u64>, PayloadBuilderError>
     where
         Builder: BlockBuilder<Primitives = Evm::Primitives>,
         <<Builder::Executor as BlockExecutor>::Evm as AlloyEvm>::DB: Database,
@@ -1092,6 +1093,7 @@ where
         let block_number = self.parent().number().saturating_add(1);
         let batch_tx_count = raw_txs.len();
         let mut included_tx_count = 0;
+        let mut included_or_invalid_tx_count = 0;
         let mut skipped_type_count = 0;
         let mut skipped_limit_count = 0;
         let mut skipped_invalid_count = 0;
@@ -1108,7 +1110,7 @@ where
                     included_tx_count,
                     "cancelled while processing ACTOR transaction batch"
                 );
-                return Ok(true);
+                return Ok(None);
             }
 
             let tx_hash = keccak256(raw_tx.as_ref());
@@ -1140,17 +1142,17 @@ where
             let miner_fee = match tx.effective_tip_per_gas(base_fee) {
                 Some(miner_fee) => miner_fee,
                 None => {
+                    skipped_invalid_count += 1;
+                    included_or_invalid_tx_count += 1;
                     info!(
                         target: "payload_builder",
                         block_number,
                         batch_index,
                         %tx_hash,
                         %base_fee,
-                        "ACTOR transaction has no valid effective tip at the block base fee"
+                        "skipping ACTOR transaction with no valid effective tip at the block base fee"
                     );
-                    return Err(PayloadBuilderError::other(std::io::Error::other(
-                        "ACTOR transaction has no valid effective tip at the block base fee",
-                    )));
+                    continue;
                 }
             };
             let tx_uncompressed_size = tx.encode_2718_len() as u64;
@@ -1225,6 +1227,7 @@ where
                     ..
                 })) => {
                     skipped_invalid_count += 1;
+                    included_or_invalid_tx_count += 1;
                     info!(
                         target: "payload_builder",
                         block_number,
@@ -1259,6 +1262,7 @@ where
             info.cumulative_uncompressed_bytes += tx_uncompressed_size;
             info.total_fees += U256::from(miner_fee) * U256::from(tx_gas_used);
             included_tx_count += 1;
+            included_or_invalid_tx_count += 1;
             info!(
                 target: "payload_builder",
                 block_number,
@@ -1286,7 +1290,7 @@ where
             fees = ?info.total_fees.saturating_sub(starting_total_fees),
             "processed ACTOR transaction batch"
         );
-        Ok(false)
+        Ok(Some(included_or_invalid_tx_count))
     }
 
     /// Fetches and executes ACTOR transaction batches until the queue is empty or the block is full.
@@ -1342,14 +1346,15 @@ where
                 break;
             }
 
-            if self.execute_encrypted_batch(
+            let Some(processed_txs) = self.execute_encrypted_batch(
                 info,
                 builder,
                 batch.txs,
                 block_gas_limit,
-            )? {
+            )? else {
                 return Ok(true);
-            }
+            };
+            actor_client.record_consumed_txs(processed_txs);
 
             if batch.block_complete {
                 break;

@@ -5,7 +5,11 @@ use alloy_primitives::Bytes;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::{
-    sync::{Arc, Mutex, mpsc::{self, Sender}},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, Sender},
+    },
     thread,
     time::Duration,
 };
@@ -17,11 +21,13 @@ use tracing::info;
 pub struct ActorClient {
     requests: Sender<RpcCommand>,
     completed_through_block: Arc<Mutex<Option<u64>>>,
+    pending_consumed_txs: Arc<AtomicU64>,
 }
 
 enum RpcCommand {
     FetchTxs {
         max_gas: u64,
+        num_consumed_txs: u64,
         response: Sender<anyhow::Result<ActorTxBatch>>,
     },
 }
@@ -38,6 +44,7 @@ struct RpcRequest {
 #[serde(rename_all = "camelCase")]
 struct RpcParams {
     max_gas: u64,
+    num_consumed_txs: u64,
 }
 
 #[derive(Deserialize)]
@@ -98,8 +105,18 @@ impl ActorClient {
                     return;
                 }
 
-                while let Ok(RpcCommand::FetchTxs { max_gas, response }) = receiver.recv() {
-                    let _ = response.send(fetch_txs(&http, &endpoint, max_gas));
+                while let Ok(RpcCommand::FetchTxs {
+                    max_gas,
+                    num_consumed_txs,
+                    response,
+                }) = receiver.recv()
+                {
+                    let _ = response.send(fetch_txs(
+                        &http,
+                        &endpoint,
+                        max_gas,
+                        num_consumed_txs,
+                    ));
                 }
             })?;
 
@@ -108,7 +125,16 @@ impl ActorClient {
             .map_err(|err| anyhow::anyhow!("ACTOR HTTP client thread stopped: {err}"))?
             .map_err(anyhow::Error::msg)?;
 
-        Ok(Self { requests, completed_through_block: Arc::new(Mutex::new(None)) })
+        Ok(Self {
+            requests,
+            completed_through_block: Arc::new(Mutex::new(None)),
+            pending_consumed_txs: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    /// Records how many transactions of the last batch were consumed; reported on the next fetch.
+    pub fn record_consumed_txs(&self, num_consumed_txs: u64) {
+        self.pending_consumed_txs.store(num_consumed_txs, Ordering::Release);
     }
 
     /// Fetches the next ordered batch.
@@ -123,9 +149,10 @@ impl ActorClient {
             .lock()
             .map_err(|_| anyhow::anyhow!("ACTOR completion state mutex poisoned"))?;
         fetch_txs_for_block(block_number, &mut completed_through_block, || {
+            let num_consumed_txs = self.pending_consumed_txs.swap(0, Ordering::AcqRel);
             let (response, result) = mpsc::channel();
             self.requests
-                .send(RpcCommand::FetchTxs { max_gas, response })
+                .send(RpcCommand::FetchTxs { max_gas, num_consumed_txs, response })
                 .map_err(|err| anyhow::anyhow!("ACTOR HTTP client thread stopped: {err}"))?;
             result
                 .recv()
@@ -152,12 +179,17 @@ fn fetch_txs_for_block(
     Ok(batch)
 }
 
-fn fetch_txs(http: &Client, endpoint: &str, max_gas: u64) -> anyhow::Result<ActorTxBatch> {
+fn fetch_txs(
+    http: &Client,
+    endpoint: &str,
+    max_gas: u64,
+    num_consumed_txs: u64,
+) -> anyhow::Result<ActorTxBatch> {
     let request = RpcRequest {
         jsonrpc: "2.0",
         id: 1,
         method: "fetchTxs",
-        params: RpcParams { max_gas },
+        params: RpcParams { max_gas, num_consumed_txs },
     };
 
     let response: RpcResponse = http
@@ -181,6 +213,19 @@ fn fetch_txs(http: &Client, endpoint: &str, max_gas: u64) -> anyhow::Result<Acto
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_params_include_gas_and_processed_transaction_count() {
+        let params = RpcParams { max_gas: 100_000, num_consumed_txs: 3 };
+
+        assert_eq!(
+            serde_json::to_value(params).unwrap(),
+            serde_json::json!({
+                "maxGas": 100_000,
+                "numConsumedTxs": 3,
+            })
+        );
+    }
 
     #[test]
     fn response_with_actx_marks_batch_complete() {

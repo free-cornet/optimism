@@ -33,7 +33,7 @@ use reth_optimism_txpool::{
 };
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_payload_util::PayloadTransactionsFixed;
-use reth_primitives_traits::{Account, InMemorySize, SealedHeader};
+use reth_primitives_traits::{Account, InMemorySize, SealedHeader, SignedTransaction};
 use reth_revm::{database::StateProviderDatabase, db::State, test_utils::StateProviderTest};
 use reth_transaction_pool::PoolTransaction;
 use std::{borrow::Cow, cell::Cell, sync::Arc};
@@ -282,6 +282,69 @@ where
         .collect();
 
     (info, included_tx_hashes)
+}
+
+#[test]
+fn execute_encrypted_batch_skips_underpriced_transaction_and_continues() {
+    let gas_limit = 1_000_000;
+    let chain_spec = Arc::new(OpChainSpecBuilder::optimism_mainnet().regolith_activated().build());
+    let mut ctx = payload_builder_ctx(chain_spec, gas_limit);
+    ctx.config.parent_header = Arc::new(SealedHeader::seal_slow(Header {
+        gas_limit,
+        number: 0,
+        timestamp: 0,
+        base_fee_per_gas: Some(100),
+        ..Default::default()
+    }));
+
+    let recipient = Address::repeat_byte(0x44);
+    let encode_tx = |tx: TxEip1559| {
+        let tx: OpTransactionSigned = tx.into_signed(Signature::test_signature()).into();
+        let signer = tx.clone().try_into_recovered().expect("test tx recovers").signer();
+        (Bytes::from(tx.encoded_2718()), signer)
+    };
+    let (underpriced_tx, underpriced_signer) = encode_tx(TxEip1559 {
+        max_fee_per_gas: 1,
+        max_priority_fee_per_gas: 1,
+        ..base_pooled_tx(0, recipient, MIN_TRANSACTION_GAS)
+    });
+    let (valid_tx, valid_signer) = encode_tx(TxEip1559 {
+        max_fee_per_gas: 100,
+        max_priority_fee_per_gas: 10,
+        ..base_pooled_tx(0, recipient, MIN_TRANSACTION_GAS)
+    });
+    let txs = vec![underpriced_tx, valid_tx];
+
+    let mut state_provider = StateProviderTest::default();
+    for signer in [underpriced_signer, valid_signer] {
+        state_provider.insert_account(
+            signer,
+            Account { balance: U256::MAX, ..Default::default() },
+            None,
+            Default::default(),
+        );
+    }
+
+    let mut db = State::builder()
+        .with_database(StateProviderDatabase::new(&state_provider))
+        .with_bundle_update()
+        .build();
+    let mut builder = ctx.block_builder(&mut db).expect("block builder can be created");
+    let mut info = ExecutionInfo::new();
+
+    let processed = ctx
+        .execute_encrypted_batch(&mut info, &mut builder, txs, gas_limit)
+        .expect("underpriced ACTOR transaction is skipped")
+        .expect("batch is not cancelled");
+
+    let outcome = builder
+        .finish(state_provider.clone(), Some((B256::ZERO, Default::default())))
+        .expect("builder finishes");
+    let included_txs = outcome.block.into_block().body.transactions;
+
+    assert_eq!(processed, 2, "both batch transactions advance the consumed cursor");
+    assert_eq!(included_txs.len(), 1, "the valid tx after the skipped tx is included");
+    assert_eq!(included_txs[0].nonce(), 0);
 }
 
 /// The opt-in is a sequencer-only control: a following node verifies the embedded `0x7D` whatever
