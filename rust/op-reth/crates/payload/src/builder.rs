@@ -1127,6 +1127,7 @@ where
             })?;
             if tx.is_eip4844() || tx.is_deposit() {
                 skipped_type_count += 1;
+                info!("fetchTxs|SKIPPED_TX|{tx_hash:x}");
                 info!(
                     target: "payload_builder",
                     block_number,
@@ -1144,6 +1145,7 @@ where
                 None => {
                     skipped_invalid_count += 1;
                     included_or_invalid_tx_count += 1;
+                    info!("fetchTxs|SKIPPED_TX|{tx_hash:x}");
                     info!(
                         target: "payload_builder",
                         block_number,
@@ -1196,6 +1198,7 @@ where
                 max_uncompressed_block_size,
             ) {
                 skipped_limit_count += 1;
+                info!("fetchTxs|SKIPPED_TX|{tx_hash:x}");
                 info!(
                     target: "payload_builder",
                     block_number,
@@ -1228,6 +1231,7 @@ where
                 })) => {
                     skipped_invalid_count += 1;
                     included_or_invalid_tx_count += 1;
+                    info!("fetchTxs|SKIPPED_TX|{tx_hash:x}");
                     info!(
                         target: "payload_builder",
                         block_number,
@@ -1263,6 +1267,7 @@ where
             info.total_fees += U256::from(miner_fee) * U256::from(tx_gas_used);
             included_tx_count += 1;
             included_or_invalid_tx_count += 1;
+            info!("fetchTxs|INCLUDED_TX|{tx_hash:x}");
             info!(
                 target: "payload_builder",
                 block_number,
