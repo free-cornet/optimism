@@ -186,7 +186,12 @@ fn test_setup_custom_precompiles() {
         >;
 
         async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
-            let OpEvmConfig { executor_factory, block_assembler, _pd: _ } =
+            let OpEvmConfig {
+                executor_factory,
+                block_assembler,
+                disable_balance_check,
+                _pd: _,
+            } =
                 OpExecutorBuilder::default().build_evm(ctx).await?;
             let uni_executor_factory = OpBlockExecutorFactory::new(
                 *executor_factory.receipt_builder(),
@@ -196,6 +201,7 @@ fn test_setup_custom_precompiles() {
             let uni_evm_config = OpEvmConfig {
                 executor_factory: uni_executor_factory,
                 block_assembler,
+                disable_balance_check,
                 _pd: PhantomData,
             };
             Ok(uni_evm_config)

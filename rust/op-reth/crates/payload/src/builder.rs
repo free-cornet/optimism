@@ -4,7 +4,7 @@ use crate::{
     error::OpPayloadBuilderError, payload::OpBuiltPayload,
 };
 
-use crate::actor::ActorClient;
+use crate::actor::{ACTX_GAS_RESERVE, ActorClient};
 
 use alloy_consensus::{BlockHeader, Sealable, Transaction, Typed2718, transaction::Recovered};
 use alloy_eips::eip2718::{Decodable2718, Encodable2718};
@@ -52,7 +52,7 @@ use reth_revm::{
 };
 use reth_storage_api::{StateProvider, StateProviderFactory, errors::ProviderError};
 use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction, TransactionPool};
-use revm::context::{Block, BlockEnv};
+use revm::{Database as RevmDatabase, context::{Block, BlockEnv}};
 use std::{marker::PhantomData, sync::Arc};
 use tracing::info;
 
@@ -1320,21 +1320,28 @@ where
             block_gas_limit = block_gas_limit.min(configured_limit);
         }
 
+        let actor_gas_limit = block_gas_limit.checked_sub(ACTX_GAS_RESERVE).ok_or_else(|| {
+            PayloadBuilderError::other(std::io::Error::other(
+                "block gas limit cannot accommodate the ACTx transaction reservation",
+            ))
+        })?;
+        let mut actor_session = actor_client.start_payload(
+            self.parent().number().saturating_add(1),
+            self.parent().hash(),
+            self.payload_id(),
+        );
+
         loop {
             if self.cancel.is_cancelled() {
                 return Ok(true);
             }
 
             // Use pre-refund gas for admission, matching is_tx_over_limits().
-            let remaining_gas = block_gas_limit
+            let remaining_gas = actor_gas_limit
                 .saturating_sub(info.cumulative_evm_gas_used);
 
-            if remaining_gas == 0 {
-                break;
-            }
-
-            let batch = actor_client
-                .fetch_txs(self.parent().number().saturating_add(1), remaining_gas)
+            let batch = actor_session
+                .fetch_txs(remaining_gas)
                 .map_err(|err| {
                     PayloadBuilderError::other(std::io::Error::other(err.to_string()))
                 })?;
@@ -1346,27 +1353,69 @@ where
                 block_complete = batch.block_complete,
                 "received ACTOR transaction batch"
             );
-            if batch.txs.is_empty() {
-                // Empty means the encrypted mempool has ended this block's queue.
-                break;
+            let empty = batch.txs.is_empty();
+            if !empty {
+                let Some(processed_txs) = self.execute_encrypted_batch(
+                    info,
+                    builder,
+                    batch.txs,
+                    actor_gas_limit,
+                )? else {
+                    return Ok(true);
+                };
+                actor_session.record_consumed_txs(processed_txs)
+                    .map_err(|err| PayloadBuilderError::other(std::io::Error::other(err.to_string())))?;
             }
 
-            let Some(processed_txs) = self.execute_encrypted_batch(
-                info,
-                builder,
-                batch.txs,
-                block_gas_limit,
-            )? else {
-                return Ok(true);
-            };
-            actor_client.record_consumed_txs(processed_txs);
+            if let Some(actx) = batch.actx {
+                let signer = actor_client.metadata_signer_address();
+                let nonce = builder.evm_mut().db_mut().basic(signer)
+                    .map_err(|err| PayloadBuilderError::other(std::io::Error::other(err.to_string())))?
+                    .map_or(0, |account| account.nonce);
+                let base_fee = builder.evm_mut().block().basefee();
+                let tx: TxTy<Evm::Primitives> = actor_client
+                    .metadata_transaction(self.chain_spec.chain().id(), nonce, base_fee, &actx)
+                    .map_err(|err| PayloadBuilderError::other(std::io::Error::other(err.to_string())))?;
+                let tx_uncompressed_size = tx.encode_2718_len() as u64;
+                let tx_gas_limit = tx.gas_limit();
+                let tx = Recovered::new_unchecked(tx, signer);
+                let tx_da_size = OpPooledTransaction::<TxTy<Evm::Primitives>>::new(
+                    tx.clone(), tx_uncompressed_size as usize,
+                ).estimated_da_size();
+                let da_footprint_gas_scalar = self.chain_spec
+                    .is_jovian_active_at_timestamp(self.attributes().timestamp())
+                    .then_some(L1BlockInfo::fetch_da_footprint_gas_scalar(builder.evm_mut().db_mut())
+                        .expect("DA footprint should always be available from the database post jovian"));
+                if info.is_tx_over_limits(
+                    tx_da_size,
+                    block_gas_limit,
+                    self.builder_config.da_config.max_da_tx_size(),
+                    self.builder_config.da_config.max_da_block_size(),
+                    tx_gas_limit,
+                    da_footprint_gas_scalar,
+                    tx_uncompressed_size,
+                    self.builder_config.max_uncompressed_block_size,
+                ) {
+                    return Err(PayloadBuilderError::other(std::io::Error::other(
+                        "ACTx metadata transaction exceeds a payload limit",
+                    )));
+                }
+                let mut evm_gas_used = 0;
+                let gas_used = builder.execute_transaction_with_result_closure(tx, |result| {
+                    evm_gas_used = result.evm_gas_used();
+                }).map_err(|err| PayloadBuilderError::EvmExecutionError(Box::new(err)))?;
+                info.accumulate_gas(gas_used.tx_gas_used(), evm_gas_used);
+                info.cumulative_da_bytes_used += tx_da_size;
+                info.cumulative_uncompressed_bytes += tx_uncompressed_size;
+                return Ok(false);
+            }
 
-            if batch.block_complete {
-                break;
+            if empty || remaining_gas == 0 {
+                return Err(PayloadBuilderError::other(std::io::Error::other(
+                    "ACTOR did not provide ACTx for the completed payload",
+                )));
             }
         }
-
-        Ok(false)
     }
 
     /// Executes the given best transactions and updates the execution info.

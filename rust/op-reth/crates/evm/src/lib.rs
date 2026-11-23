@@ -91,6 +91,8 @@ pub struct OpEvmConfig<
     pub executor_factory: OpBlockExecutorFactory<R, Arc<ChainSpec>, EvmFactory>,
     /// Optimism block assembler.
     pub block_assembler: OpBlockAssembler<ChainSpec>,
+    /// Dev-only EVM transaction balance-check bypass.
+    pub disable_balance_check: bool,
     #[doc(hidden)]
     pub _pd: core::marker::PhantomData<N>,
 }
@@ -102,6 +104,7 @@ impl<ChainSpec, N: NodePrimitives, R: Clone, EvmFactory: Clone> Clone
         Self {
             executor_factory: self.executor_factory.clone(),
             block_assembler: self.block_assembler.clone(),
+            disable_balance_check: self.disable_balance_check,
             _pd: self._pd,
         }
     }
@@ -124,8 +127,20 @@ impl<ChainSpec, N: NodePrimitives, R, EvmFactory> OpEvmConfig<ChainSpec, N, R, E
         Self {
             block_assembler: OpBlockAssembler::new(chain_spec.clone()),
             executor_factory: OpBlockExecutorFactory::new(receipt_builder, chain_spec, evm_factory),
+            disable_balance_check: false,
             _pd: core::marker::PhantomData,
         }
+    }
+
+    /// Enables the dev-only EVM transaction balance-check bypass.
+    pub fn with_disable_balance_check(mut self, disable: bool) -> Result<Self, &'static str> {
+        if disable && !cfg!(feature = "optional-balance-check") {
+            return Err(
+                "balance-check bypass requires building with --features reth-optimism-evm/optional-balance-check",
+            );
+        }
+        self.disable_balance_check = disable;
+        Ok(self)
     }
 }
 
@@ -270,7 +285,14 @@ where
     }
 
     fn evm_env(&self, header: &Header) -> Result<EvmEnv<OpSpecId>, Self::Error> {
-        Ok(evm_env_for_op_block(header, self.chain_spec(), self.chain_spec().chain().id()))
+        let env = evm_env_for_op_block(header, self.chain_spec(), self.chain_spec().chain().id());
+        #[cfg(feature = "optional-balance-check")]
+        let env = {
+            let mut env = env;
+            env.cfg_env.disable_balance_check = self.disable_balance_check;
+            env
+        };
+        Ok(env)
     }
 
     fn next_evm_env(
@@ -278,7 +300,7 @@ where
         parent: &Header,
         attributes: &Self::NextBlockEnvCtx,
     ) -> Result<EvmEnv<OpSpecId>, Self::Error> {
-        Ok(evm_env_for_op_next_block(
+        let env = evm_env_for_op_next_block(
             parent,
             NextEvmEnvAttributes {
                 timestamp: attributes.timestamp,
@@ -290,7 +312,14 @@ where
             self.chain_spec().next_block_base_fee(parent, attributes.timestamp).unwrap_or_default(),
             self.chain_spec(),
             self.chain_spec().chain().id(),
-        ))
+        );
+        #[cfg(feature = "optional-balance-check")]
+        let env = {
+            let mut env = env;
+            env.cfg_env.disable_balance_check = self.disable_balance_check;
+            env
+        };
+        Ok(env)
     }
 
     fn context_for_block(
@@ -350,6 +379,12 @@ where
         let cfg_env = CfgEnv::new()
             .with_chain_id(self.chain_spec().chain().id())
             .with_spec_and_mainnet_gas_params(spec);
+        #[cfg(feature = "optional-balance-check")]
+        let cfg_env = {
+            let mut cfg_env = cfg_env;
+            cfg_env.disable_balance_check = self.disable_balance_check;
+            cfg_env
+        };
 
         let blob_excess_gas_and_price = spec
             .into_eth_spec()
@@ -563,6 +598,18 @@ mod tests {
         // Assert that the chain ID in the `cfg_env` is correctly set to the chain ID of the
         // ChainSpec
         assert_eq!(cfg_env.chain_id, chain_spec.chain().id());
+    }
+
+    #[cfg(feature = "optional-balance-check")]
+    #[test]
+    fn dev_balance_check_bypass_is_enabled_for_block_execution() {
+        let env = test_evm_config()
+            .with_disable_balance_check(true)
+            .unwrap()
+            .evm_env(&Header::default())
+            .unwrap();
+
+        assert!(env.cfg_env.disable_balance_check);
     }
 
     #[test]

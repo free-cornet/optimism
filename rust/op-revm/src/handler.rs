@@ -162,14 +162,30 @@ where
             let Some(additional_cost) = chain.tx_cost_with_tx(tx, spec) else {
                 return Err(OpTransactionError::MissingEnvelopedTx.into());
             };
-            let Some(new_balance) = balance.checked_sub(additional_cost) else {
-                return Err(InvalidTransaction::LackOfFundForMaxFee {
-                    fee: Box::new(additional_cost),
-                    balance: Box::new(balance),
-                }
-                .into());
-            };
-            balance = new_balance
+            #[cfg(feature = "optional_balance_check")]
+            if cfg.is_balance_check_disabled() {
+                balance = balance.saturating_sub(additional_cost);
+            } else {
+                let Some(new_balance) = balance.checked_sub(additional_cost) else {
+                    return Err(InvalidTransaction::LackOfFundForMaxFee {
+                        fee: Box::new(additional_cost),
+                        balance: Box::new(balance),
+                    }
+                    .into());
+                };
+                balance = new_balance;
+            }
+            #[cfg(not(feature = "optional_balance_check"))]
+            {
+                let Some(new_balance) = balance.checked_sub(additional_cost) else {
+                    return Err(InvalidTransaction::LackOfFundForMaxFee {
+                        fee: Box::new(additional_cost),
+                        balance: Box::new(balance),
+                    }
+                    .into());
+                };
+                balance = new_balance;
+            }
         }
 
         let balance = calculate_caller_fee(balance, tx, block, cfg)?;
@@ -1298,6 +1314,37 @@ mod tests {
                 .into(),
             ))
         );
+    }
+
+    #[cfg(feature = "optional_balance_check")]
+    #[test]
+    fn test_remove_l1_cost_skips_insufficient_balance_check_when_disabled() {
+        let caller = Address::ZERO;
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(caller, AccountInfo::default());
+        let mut cfg = CfgEnv::new_with_spec(OpSpecId::REGOLITH);
+        cfg.disable_balance_check = true;
+        let ctx = Context::op()
+            .with_db(db)
+            .with_chain(L1BlockInfo {
+                l1_base_fee: U256::from(1_000),
+                l1_fee_overhead: Some(U256::from(1_000)),
+                l1_base_fee_scalar: U256::from(1_000),
+                l2_block: Some(U256::from(0)),
+                ..Default::default()
+            })
+            .with_cfg(cfg)
+            .modify_tx_chained(|tx| {
+                tx.enveloped_tx = Some(bytes!("FACADE"));
+            });
+
+        let mut evm = ctx.build_op();
+        let handler =
+            OpHandler::<_, EVMError<_, OpTransactionError>, EthFrame<EthInterpreter>>::new();
+
+        assert!(handler
+            .validate_against_state_and_deduct_caller(&mut evm, &mut Default::default())
+            .is_ok());
     }
 
     #[test]

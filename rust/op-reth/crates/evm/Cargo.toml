@@ -81,6 +81,7 @@ std = [
 	"op-alloy-rpc-types?/std",
 	"alloy-rpc-types-eth?/std"
 ]
+optional-balance-check = ["revm/optional_balance_check", "op-revm/optional_balance_check"]
 portable = [
     "reth-revm/portable",
     "op-revm/portable",

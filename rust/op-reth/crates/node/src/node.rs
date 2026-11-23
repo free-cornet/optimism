@@ -305,7 +305,10 @@ impl OpNode {
         let RollupArgs { disable_txpool_gossip, discovery_v4, .. } = self.args;
         ComponentsBuilder::default()
             .node_types::<Node>()
-            .executor(OpExecutorBuilder::default())
+            .executor(
+                OpExecutorBuilder::default()
+                    .with_disable_balance_check(self.args.dev_disable_balance_check),
+            )
             .pool(self.standard_pool_builder())
             .payload(BasicPayloadServiceBuilder::new(self.payload_builder()))
             .network(OpNetworkBuilder::new(disable_txpool_gossip, !discovery_v4))
@@ -1113,7 +1116,17 @@ impl<NetworkT, RpcMiddleware> OpAddOnsBuilder<NetworkT, RpcMiddleware> {
 /// A regular optimism evm and executor builder.
 #[derive(Debug, Copy, Clone, Default)]
 #[non_exhaustive]
-pub struct OpExecutorBuilder {}
+pub struct OpExecutorBuilder {
+    disable_balance_check: bool,
+}
+
+impl OpExecutorBuilder {
+    /// Configures the dev-only EVM balance-check bypass.
+    pub const fn with_disable_balance_check(mut self, disable: bool) -> Self {
+        self.disable_balance_check = disable;
+        self
+    }
+}
 
 impl<Node> ExecutorBuilder<Node> for OpExecutorBuilder
 where
@@ -1123,7 +1136,9 @@ where
         OpEvmConfig<<Node::Types as NodeTypes>::ChainSpec, <Node::Types as NodeTypes>::Primitives>;
 
     async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
-        Ok(OpEvmConfig::new(ctx.chain_spec(), OpRethReceiptBuilder::default()))
+        OpEvmConfig::new(ctx.chain_spec(), OpRethReceiptBuilder::default())
+            .with_disable_balance_check(self.disable_balance_check)
+            .map_err(eyre::Report::msg)
     }
 }
 
@@ -1594,7 +1609,7 @@ where
         )
         .with_transactions(self.best_transactions.clone())
         .with_actor_client(Arc::new(
-            ActorClient::new("http://127.0.0.1:12345")
+            ActorClient::new("http://127.0.0.1:12347")
                 .map_err(|err| eyre::eyre!(err.to_string()))?,
         ))
         .set_compute_pending_block(self.compute_pending_block);

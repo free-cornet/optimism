@@ -2,7 +2,7 @@ use super::{
     CommittedTxGas, ExecutionInfo, OpPayloadBuilderCtx, PayloadTransactionsWithCommitHook,
     RethPayloadTransactions, build_post_exec_recovered_tx, try_include_post_exec_tx,
 };
-use crate::{OpPayloadBuilderAttributes, config::OpBuilderConfig};
+use crate::{OpPayloadBuilderAttributes, actor::ActorClient, config::OpBuilderConfig};
 use alloy_consensus::{
     Header, Sealable, SignableTransaction, Transaction, TxEip1559, Typed2718,
     transaction::{Recovered, TxHashRef},
@@ -15,6 +15,7 @@ use alloy_eips::{
 use alloy_evm::RecoveredTx;
 use alloy_primitives::{Address, B64, B256, Bytes, Signature, TxHash, TxKind, U256};
 use alloy_rpc_types_eth::erc4337::TransactionConditional;
+use alloy_signer_local::PrivateKeySigner;
 use op_alloy_consensus::{
     POST_EXEC_PAYLOAD_VERSION, PostExecPayload, SDMGasEntry, build_post_exec_tx,
 };
@@ -36,7 +37,14 @@ use reth_payload_util::PayloadTransactionsFixed;
 use reth_primitives_traits::{Account, InMemorySize, SealedHeader, SignedTransaction};
 use reth_revm::{database::StateProviderDatabase, db::State, test_utils::StateProviderTest};
 use reth_transaction_pool::PoolTransaction;
-use std::{borrow::Cow, cell::Cell, sync::Arc};
+use std::{
+    borrow::Cow,
+    cell::Cell,
+    io::{BufRead, BufReader, Read, Write},
+    net::TcpListener,
+    sync::Arc,
+    thread,
+};
 
 fn entries(specs: &[(u64, u64)]) -> Vec<SDMGasEntry> {
     specs.iter().map(|&(index, gas_refund)| SDMGasEntry { index, gas_refund }).collect()
@@ -345,6 +353,63 @@ fn execute_encrypted_batch_skips_underpriced_transaction_and_continues() {
     assert_eq!(processed, 2, "both batch transactions advance the consumed cursor");
     assert_eq!(included_txs.len(), 1, "the valid tx after the skipped tx is included");
     assert_eq!(included_txs[0].nonce(), 0);
+}
+
+#[test]
+fn actor_actx_is_included_and_replayed_with_the_payload() {
+    let actx = r#"{"blockNumber":23,"orderedTxs":[],"signature":"abcdef"}"#;
+    let response = format!(r#"{{"result":{{"txs":[],"actx":{actx}}}}}"#);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut content_length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" { break; }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                content_length = value.trim().parse::<usize>().unwrap();
+            }
+        }
+        let mut body = vec![0; content_length];
+        reader.read_exact(&mut body).unwrap();
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+    });
+    let signer: PrivateKeySigner =
+        "0000000000000000000000000000000000000000000000000000000000000001"
+            .parse().unwrap();
+    let signer_address = signer.address();
+    let actor_client = ActorClient::with_signer(endpoint, signer).unwrap();
+    let gas_limit = 10_000_000;
+    let chain_spec = Arc::new(OpChainSpecBuilder::optimism_mainnet().regolith_activated().build());
+    let ctx = payload_builder_ctx(chain_spec, gas_limit);
+    let mut state_provider = StateProviderTest::default();
+    state_provider.insert_account(
+        signer_address,
+        Account { balance: U256::MAX, ..Default::default() },
+        None,
+        Default::default(),
+    );
+
+    for _ in 0..2 {
+        let mut db = State::builder()
+            .with_database(StateProviderDatabase::new(&state_provider))
+            .with_bundle_update()
+            .build();
+        let mut builder = ctx.block_builder(&mut db).unwrap();
+        let mut info = ExecutionInfo::new();
+        assert!(!ctx.execute_encrypted_transactions(&mut info, &mut builder, &actor_client).unwrap());
+        let outcome = builder
+            .finish(state_provider.clone(), Some((B256::ZERO, Default::default())))
+            .unwrap();
+        let transactions = outcome.block.into_block().body.transactions;
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].input().as_ref(), actx.as_bytes());
+        assert!(info.cumulative_gas_used > 0);
+    }
+    server.join().unwrap();
 }
 
 /// The opt-in is a sequencer-only control: a following node verifies the embedded `0x7D` whatever

@@ -180,6 +180,14 @@ pub struct RollupArgs {
     )]
     pub operator_sdm_opt_in: bool,
 
+    /// Dev-only: disable EVM transaction sender balance checks.
+    ///
+    /// This changes transaction execution semantics for every transaction and can make locally
+    /// built blocks invalid on nodes that do not use the same setting. Requires building with
+    /// `--features reth-optimism-evm/optional-balance-check`.
+    #[arg(long = "rollup.dev-disable-balance-check")]
+    pub dev_disable_balance_check: bool,
+
     /// HTTP endpoint(s) for the interop filter, used to validate the interop messages referenced
     /// by incoming transactions. Repeat the flag to configure multiple endpoints; each check is
     /// fanned out to all of them and combined by quorum agreement (see
@@ -306,6 +314,7 @@ impl Default for RollupArgs {
             enable_tx_conditional: false,
             retain_forwarded_txs: false,
             operator_sdm_opt_in: false,
+            dev_disable_balance_check: false,
             interop_http: Vec::new(),
             interop_min_responses: None,
             interop_safety_level: SafetyLevel::CrossUnsafe,
@@ -343,6 +352,17 @@ mod tests {
         let default_args = RollupArgs::default();
         let args = CommandParser::<RollupArgs>::parse_from(["reth"]).args;
         assert_eq!(args, default_args);
+    }
+
+    #[test]
+    fn test_parse_optimism_dev_disable_balance_check() {
+        let expected_args = RollupArgs { dev_disable_balance_check: true, ..Default::default() };
+        let args = CommandParser::<RollupArgs>::parse_from([
+            "reth",
+            "--rollup.dev-disable-balance-check",
+        ])
+        .args;
+        assert_eq!(args, expected_args);
     }
 
     #[test]
