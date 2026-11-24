@@ -53,8 +53,20 @@ use reth_revm::{
 use reth_storage_api::{StateProvider, StateProviderFactory, errors::ProviderError};
 use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction, TransactionPool};
 use revm::{Database as RevmDatabase, context::{Block, BlockEnv}};
-use std::{marker::PhantomData, sync::Arc};
+use std::{marker::PhantomData, sync::Arc, time::Duration};
 use tracing::info;
+
+const ACTOR_PAYLOAD_BUILD_MARGIN: Duration = Duration::from_millis(200);
+
+fn actor_payload_build_delay() -> Duration {
+    let clustering_end_time = std::env::var("ACTOR_CLUSTERING_END_TIME")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+        .unwrap_or(Duration::from_millis(1500));
+    clustering_end_time.saturating_add(ACTOR_PAYLOAD_BUILD_MARGIN)
+}
 
 /// SDM/PostExec payload-builder metrics.
 #[derive(Metrics, Clone)]
@@ -485,6 +497,15 @@ impl<Txs> OpBuilder<'_, Txs> {
         Attrs: OpAttributes<Transaction = N::SignedTx>,
     {
         let Self { best, actor_client } = self;
+        let actor_mempool_build = actor_client.is_some() && !ctx.attributes().no_tx_pool();
+        if actor_mempool_build {
+            // Let the block's transaction release window reach ACTOR before taking its one-shot
+            // ordered batch snapshot.
+            std::thread::sleep(actor_payload_build_delay());
+            if ctx.cancel.is_cancelled() {
+                return Ok(BuildOutcomeKind::Cancelled);
+            }
+        }
         info!(target: "payload_builder", id=%ctx.payload_id(), parent_header = ?ctx.parent().hash(), parent_number = ctx.parent().number(), "building new payload");
 
         let mut db = State::builder().with_database(db).with_bundle_update().build();
@@ -588,10 +609,10 @@ impl<Txs> OpBuilder<'_, Txs> {
         let payload =
             OpBuiltPayload::new(ctx.payload_id(), sealed_block, info.total_fees, Some(executed));
 
-        if no_tx_pool {
+        if no_tx_pool || actor_mempool_build {
             // if `no_tx_pool` is set only transactions from the payload attributes will be included
-            // in the payload. In other words, the payload is deterministic and we can
-            // freeze it once we've successfully built it.
+            // in the payload. ACTOR-backed builds also use a one-shot batch snapshot, so freeze
+            // the successful result rather than rebuilding the same payload on later interval ticks.
             Ok(BuildOutcomeKind::Freeze(payload))
         } else {
             Ok(BuildOutcomeKind::Better { payload })
